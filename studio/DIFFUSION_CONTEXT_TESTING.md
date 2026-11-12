@@ -59,7 +59,62 @@ from the configured corporate `PIP_INDEX_URL` and `npm_config_registry` values
 first. Do not silently fall back to public feeds. Include any required feed
 authentication in the private configuration, never in the Dockerfiles.
 
-## Build the CUDA runner
+## Native Windows runtime
+
+Use a native Windows CUDA runner when testing on the Windows host. The
+container runner and Windows adapter described below are an alternative
+**container runtime**, not a cross-compiled Windows runner: the adapter starts
+a WSL container for every model load. Building a Linux executable in WSL does
+not make it runnable on Windows.
+
+On Windows ARM64, open an ARM64 Visual Studio Developer PowerShell with CMake
+and Ninja available. Set `CUDA_PATH` to a Windows CUDA toolkit containing
+`bin\nvcc.exe` and the ARM64 target libraries in `lib\arm64`. CUDA 13.4.92
+supports the tested RTX Spark N1X target and the Visual Studio 2026 compiler.
+Keep this toolkit outside the checkouts.
+
+```powershell
+$Build = Join-Path $Native 'build-windows-arm64'
+cmake -S $Native -B $Build -G Ninja `
+  "-DCMAKE_TOOLCHAIN_FILE=$Native\cmake\arm64-windows-msvc-cuda.cmake" `
+  "-DCUDAToolkit_ROOT=$env:CUDA_PATH" `
+  "-DCMAKE_CROSSCOMPILING_EMULATOR=$env:ComSpec;/c" `
+  -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=121a-real `
+  -DGGML_CUDA=ON -DGGML_CUDA_NCCL=OFF -DGGML_NATIVE=ON `
+  -DGGML_OPENMP=OFF -DGGML_CCACHE=OFF `
+  -DLLAMA_OPENSSL=OFF -DLLAMA_BUILD_UI=OFF -DLLAMA_BUILD_TESTS=ON `
+  -DLLAMA_BUILD_APP=OFF -DLLAMA_BUILD_TOOLS=OFF `
+  -DLLAMA_BUILD_SERVER=OFF -DLLAMA_BUILD_EXAMPLES=ON
+if ($LASTEXITCODE) { throw 'Native Windows configuration failed' }
+cmake --build $Build --target llama-diffusion-gemma-visual-server `
+  test-diffusion-context-sizing test-llama-archs --parallel 4
+if ($LASTEXITCODE) { throw 'Native Windows runner build failed' }
+
+# The target matches this host, so compiler probes can run directly through cmd.
+# Use a CUDA architecture appropriate for the destination GPU on other machines.
+Get-ChildItem "$env:CUDA_PATH\bin\arm64" -Filter '*.dll' |
+  Copy-Item -Destination "$Build\bin"
+
+$env:DG_BRIDGE_PYTHON = (Resolve-Path "$HOME\.unsloth\studio\unsloth_studio\Scripts\python.exe").Path
+$env:DG_VISUAL_BIN = Join-Path $Build 'bin\llama-diffusion-gemma-visual-server.exe'
+$env:DG_ZOO_SOURCE = $Zoo
+$env:PYTHONPATH = "$Studio;$Zoo"
+& $env:DG_VISUAL_BIN --capabilities
+& "$Build\bin\test-diffusion-context-sizing.exe"
+& "$Build\bin\test-llama-archs.exe" -a diffusion-gemma -b CUDA0
+```
+
+The capability response must include `exact_context_v1`. Skip the container
+runner, Windows adapter, and container-only synthetic checks below, then build
+the UI and launch Studio with these environment variables. The model runner
+must appear as a Windows process; no model container should start.
+
+Windows GPU memory budgets can include RAM outside the CPU-visible memory
+pool. The native runner checks CPU and GPU budgets separately. Do not compare
+the combined GPU context and host staging allocations against CPU RAM alone,
+or replace the CUDA budget with WSL guest RAM.
+
+## Container alternative: build the CUDA runner
 
 The development image installs its compiler tools and CUDA toolkit **inside
 the container**. No CMake, Ninja, Zig, or CUDA toolkit installation on Windows
@@ -107,7 +162,7 @@ comes from `--gpus all`; the build secret is not copied into the image. CUDA
 compilation may take several minutes. The BuildKit cache preserves compiled
 objects across development rebuilds.
 
-## Build the Windows adapter
+## Container alternative: build the Windows adapter
 
 The adapter exposes the native stdin/stdout protocol as a Windows executable.
 It preserves Unicode paths, mounts only the model directory and a temporary
