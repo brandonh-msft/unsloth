@@ -71,3 +71,7 @@ test("the existing info hint owns the mode explanation and fitted result", () =>
     /<p className="text-ui-11 leading-relaxed text-muted-foreground">/,
   );
 });
+
+test("diffusion shows its fixed single slot rather than an editable setting", () => {
+  assert.match(panelCode, /isDiffusion \? \([\s\S]*Parallel Slots[\s\S]*one request at a time[\s\S]*\) : \( <ParallelSlotsRow/);
+});

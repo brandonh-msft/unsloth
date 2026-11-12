@@ -2089,12 +2089,22 @@ function GgufAdvancedSettings({
         </div>
       )}
 
-      <ParallelSlotsRow
-        config={config}
-        update={update}
-        hint={GGUF_PARALLEL_HINT}
-        focusOnMount={focusParallelSlots}
-      />
+      {isDiffusion ? (
+        <div className={ROW_CLASS}>
+          <div className="flex min-w-0 items-center gap-1.5">
+            <span className={LABEL_CLASS}>Parallel Slots</span>
+            <InfoHint>DiffusionGemma runs one request at a time; other requests wait.</InfoHint>
+          </div>
+          <span>1</span>
+        </div>
+      ) : (
+        <ParallelSlotsRow
+          config={config}
+          update={update}
+          hint={GGUF_PARALLEL_HINT}
+          focusOnMount={focusParallelSlots}
+        />
+      )}
 
       {!isDiffusion && (
         <div className="space-y-1">

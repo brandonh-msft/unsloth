@@ -4789,10 +4789,9 @@ def _diffusion_auto_ngl(
 ) -> Optional[int]:
     """GPU layers for an Auto-mode diffusion load, or None to keep every layer on the GPU.
 
-    Only a GGUF that cannot fit moves: all layers die in cudaMalloc, or on Windows spill into
-    shared system memory until RAM and the page file run out (#6456). The split leaves room
-    for the compute buffer (measured 1.75x the [n_head, N, N] fp32 scores) and the 8% of VRAM
-    the runner's context probe keeps free (diffusion-gemma-visual-server.cpp)."""
+    A GGUF that cannot fit moves: all layers die in cudaMalloc, or on Windows spill into
+    shared system memory until RAM and the page file run out (#6456). Large explicit
+    contexts also reserve room for chunked attention and the runner's VRAM headroom."""
     if not file_bytes or not n_layers or n_layers <= 0 or (free_mib <= 0 and total_mib <= 0):
         return None
     usable = _vram_usable_mib(
@@ -4800,12 +4799,22 @@ def _diffusion_auto_ngl(
     )
     usable -= _DIFFUSION_RUNNER_OVERHEAD_MIB
     file_mib = file_bytes / (1024 * 1024)
-    if file_mib <= usable:
+    if file_mib <= usable and maxtok <= 8192:
         return None
-    # Mirrors unsloth_zoo's _canvas_maxtok: larger requests are sent as 0 (auto-size).
-    n_ctx = maxtok if 0 < maxtok <= 8192 else _DIFFUSION_FIT_CTX
-    scores_mib = max(1, n_head or 1) * n_ctx * n_ctx * 4 / (1024 * 1024)
-    ctx_reserve = 1.75 * scores_mib + 0.08 * (total_mib if total_mib > 0 else free_mib)
+    n_ctx = maxtok if maxtok > 0 else _DIFFUSION_FIT_CTX
+    n_ctx = ((n_ctx + 255) // 256) * 256
+    heads = max(1, n_head or 1)
+    # The single-device runner prefills in chunks; retaining the full square for
+    # small contexts preserves the existing conservative automatic-fit reserve.
+    chunk = min(n_ctx, max(256, min(2048, (1 << 30) // (heads * n_ctx))))
+    scores_mib = heads * n_ctx * (n_ctx if n_ctx <= 8192 else chunk) * 4 / (1024 * 1024)
+    workspace = 1.75 * scores_mib
+    if maxtok > 8192:
+        # The native explicit-context check requires 30% free-memory headroom.
+        workspace /= 0.7
+    ctx_reserve = workspace + 0.08 * (total_mib if total_mib > 0 else free_mib)
+    if file_mib + ctx_reserve <= usable:
+        return None
     # The whole file over the block count also charges token_embd, which stays on the CPU.
     per_layer_mib = file_mib / n_layers
     return max(0, min(n_layers - 1, int((usable - ctx_reserve) // per_layer_mib)))
@@ -19620,8 +19629,7 @@ class LlamaCppBackend:
         interface as llama-server, so the rest of Unsloth is unchanged.
 
         Manual mode forwards gpu_layers as --ngl so a GGUF larger than VRAM can be
-        split across GPU and RAM; auto keeps every layer on the GPU unless the GGUF
-        cannot fit it."""
+        split across GPU and RAM; auto also leaves room for a large explicit context."""
         assets = self._find_diffusion_assets()
         if assets is None:
             raise RuntimeError(
@@ -19635,8 +19643,8 @@ class LlamaCppBackend:
 
         self._kill_process()
         self._port = self._find_free_port()
-        # 0 = the visual server auto-sizes context to VRAM, capped at the training context; an in-range n_ctx overrides.
-        maxtok = n_ctx if (n_ctx and 0 < n_ctx <= 65536) else 0
+        # 0 asks the visual server to auto-size; every positive request is exact.
+        maxtok = max(0, int(n_ctx))
         # Honour the manual split (unpinned, every layer goes to GPU and a GGUF over VRAM dies in cudaMalloc even at 0 layers); drop --ngl for an old shim.
         manual_ngl = _diffusion_manual_ngl(gpu_memory_mode, gpu_layers)
         if manual_ngl is not None and not _shim_supports_ngl(shim_cmd):
@@ -19695,7 +19703,7 @@ class LlamaCppBackend:
             # Pin the context the split was sized for. Left to auto-size, the runner's second
             # probe pass sizes against host RAM, which on Windows the driver backs with
             # shared memory instead of refusing.
-            if fit_ngl is not None and not 0 < maxtok <= 8192:
+            if fit_ngl is not None and maxtok == 0:
                 maxtok = _DIFFUSION_FIT_CTX
             # Nothing fits: run on the CPU like a manual zero-layer split, not on a
             # GPU context the card may not have room for.
@@ -19874,6 +19882,7 @@ class LlamaCppBackend:
         self._spill_plan_flags = []
         # Diffusion is never tensor-parallel: clear prior TP state, since phase 1 only kills the process; else /status misreports TP and re-Apply reloads.
         self._tensor_parallel = False
+        self._reset_effective_parallel_slots()
         # A diffusion runner holds VRAM; a leftover arch-gate flag would claim it does not, letting the arbiter run a competing workload into it.
         self._arch_gate_forced_cpu = False
         # Record the devices the runner got: the lowest selected GPU, or the split above.
@@ -19906,6 +19915,66 @@ class LlamaCppBackend:
 
         healthy = self._wait_for_health(timeout = self._HEALTH_STALL_TIMEOUT_S, cancelled = cancelled)
         if healthy:
+            chosen = None
+            reported_request = None
+            for attempt in range(3):
+                try:
+                    response = httpx.get(
+                        f"{self.base_url}/health",
+                        timeout = 2.0,
+                        trust_env = False,
+                        verify = _local_ssl_context(),
+                    )
+                    if response.status_code == 200:
+                        health = response.json()
+                        value = health.get("context_length")
+                        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+                            chosen = value
+                        value = health.get("requested_context_length")
+                        if isinstance(value, int) and not isinstance(value, bool):
+                            reported_request = value
+                        break
+                except (httpx.HTTPError, ValueError, AttributeError) as e:
+                    logger.debug("DiffusionGemma health did not report its context: %s", e)
+                if attempt < 2 and not (cancelled is not None and cancelled()):
+                    time.sleep(0.1)
+            # Older shims omit context_length. Their native ready log is a
+            # valid fallback, but the drain thread may still be catching up.
+            if chosen is None:
+                for _ in range(20):
+                    for line in reversed(self._stdout_lines):
+                        match = re.search(
+                            r"diffusion-gemma-visual-server ready .*MAXTOK=(\d+)", line
+                        )
+                        if match:
+                            chosen = int(match.group(1))
+                            break
+                    if chosen is not None or (cancelled is not None and cancelled()):
+                        break
+                    time.sleep(0.1)
+            if cancelled is not None and cancelled():
+                logger.info("DiffusionGemma start cancelled while verifying its context")
+                self._kill_process()
+                return False
+            # An old shim can turn a large explicit request into auto and happen
+            # to choose the same size, so the resolved value alone is not proof.
+            if n_ctx > 8192 and reported_request != n_ctx:
+                self._kill_process()
+                raise RuntimeError(
+                    f"DiffusionGemma could not verify the requested {n_ctx}-token context. "
+                    "Update unsloth_zoo and the DiffusionGemma runner."
+                )
+            if n_ctx > 0 and chosen != n_ctx:
+                self._kill_process()
+                if chosen is None:
+                    raise RuntimeError(
+                        f"DiffusionGemma could not verify the requested {n_ctx}-token context. "
+                        "Update unsloth_zoo and the DiffusionGemma runner."
+                    )
+                raise RuntimeError(
+                    f"DiffusionGemma requested a {n_ctx}-token context but the runner "
+                    f"reported {chosen}. Update unsloth_zoo and the DiffusionGemma runner."
+                )
             if not self._publish_healthy():
                 # A teardown between the probe and this commit is already killing the runner; publishing would advertise a dead server.
                 self._kill_process()
@@ -19916,16 +19985,6 @@ class LlamaCppBackend:
                 # No spec block to drop, so launched equals requested; rebind so a record from a prior GGUF load cannot outlive it.
                 self._requested_extra_args = list(extra_args)
                 self._extra_args_source = (model_identifier, hf_variant)
-            # The visual server logs MAXTOK=<N>, the context it resolved; read it back for the UI.
-            chosen = maxtok
-            try:
-                for _ln in reversed(self._stdout_lines):
-                    _m = re.search(r"MAXTOK=(\d+)", _ln)
-                    if _m:
-                        chosen = int(_m.group(1))
-                        break
-            except Exception:
-                pass
             if chosen and chosen > 0:
                 self._effective_context_length = chosen
                 self._max_context_length = chosen
@@ -19943,6 +20002,16 @@ class LlamaCppBackend:
                 self._kill_process()
             else:
                 logger.error("DiffusionGemma runner failed to become healthy")
+                self._kill_process()
+                marker = "DIFFUSION_CONTEXT_ERROR:"
+                for line in reversed(self._stdout_lines):
+                    if marker in line:
+                        raise RuntimeError(line.split(marker, 1)[1].strip())
+                if n_ctx > 0:
+                    raise RuntimeError(
+                        f"DiffusionGemma could not start with the requested {n_ctx}-token "
+                        "context. Check available memory and update the DiffusionGemma runner."
+                    )
         return healthy
 
     # ── HF download (no lock held) ───────────────────────────────

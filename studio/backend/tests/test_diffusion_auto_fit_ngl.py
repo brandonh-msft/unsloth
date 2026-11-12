@@ -71,9 +71,15 @@ def test_larger_context_leaves_fewer_layers_and_auto_size_uses_the_default():
     default = llama_cpp_module._diffusion_auto_ngl(_Q4, 30, 16, 4096, 14_900, 15_360)
     big = llama_cpp_module._diffusion_auto_ngl(_Q4, 30, 16, 8192, 14_900, 15_360)
     assert small > default > big
-    # The zoo sends anything past 8192 as 0 (auto-size): priced at the default context.
+    # Auto still prices the safe default, but an explicit larger context must cost more.
     assert llama_cpp_module._diffusion_auto_ngl(_Q4, 30, 16, 0, 14_900, 15_360) == default
-    assert llama_cpp_module._diffusion_auto_ngl(_Q4, 30, 16, 32768, 14_900, 15_360) == default
+    assert llama_cpp_module._diffusion_auto_ngl(_Q4, 30, 16, 32768, 14_900, 15_360) < default
+
+
+def test_large_context_fits_layers_even_when_weights_alone_fit():
+    assert llama_cpp_module._diffusion_auto_ngl(_Q4, 30, 16, 4096, 23_500, 24_576) is None
+    assert 0 <= llama_cpp_module._diffusion_auto_ngl(_Q4, 30, 16, 32768, 23_500, 24_576) < 30
+    assert llama_cpp_module._diffusion_auto_ngl(_Q4, 30, 16, 32768, 178_000, 183_359) is None
 
 
 def test_split_never_goes_negative_and_unknowns_keep_the_default():
@@ -229,15 +235,19 @@ def _maxtok(cmd):
     return cmd[cmd.index("--maxtok") + 1]
 
 
-def test_fitted_launch_pins_the_context_it_was_sized_for(monkeypatch, tmp_path):
-    # Auto-sized (0 / past the zoo's 8192 clamp): the split priced 4096, so send that.
-    for n_ctx in (0, 32768):
-        cmd, backend = _launch(monkeypatch, tmp_path, [(0, 7_800, 8_188)], n_ctx = n_ctx)
-        assert (_ngl(cmd), _maxtok(cmd)) == ("8", "4096")
-        # Recorded too, for a runner that never reports the MAXTOK it resolved.
-        assert backend._effective_context_length == 4096
+def test_fitted_launch_pins_only_the_auto_context(monkeypatch, tmp_path):
+    cmd, backend = _launch(monkeypatch, tmp_path, [(0, 7_800, 8_188)], n_ctx = 0)
+    assert (_ngl(cmd), _maxtok(cmd)) == ("8", "4096")
+    assert backend._effective_context_length == 4096
     cmd, _backend = _launch(monkeypatch, tmp_path, [(0, 7_800, 8_188)], n_ctx = 2048)
     assert (_ngl(cmd), _maxtok(cmd)) == ("11", "2048")
+
+
+@pytest.mark.parametrize("n_ctx", [24576, 65535, 262144])
+def test_fitted_launch_preserves_explicit_context(monkeypatch, tmp_path, n_ctx):
+    cmd, backend = _launch(monkeypatch, tmp_path, [(0, 7_800, 8_188)], n_ctx = n_ctx)
+    assert _maxtok(cmd) == str(n_ctx)
+    assert backend._effective_context_length == n_ctx
 
 
 def test_zero_layer_fit_runs_on_the_cpu(monkeypatch, tmp_path):
@@ -277,7 +287,7 @@ def test_stop_during_the_fit_probe_spawns_nothing(monkeypatch, tmp_path):
 
 
 def test_auto_launch_that_fits_is_unchanged(monkeypatch, tmp_path):
-    for n_ctx in (0, 4096, 32768):
+    for n_ctx in (0, 4096):
         cmd, _backend = _launch(monkeypatch, tmp_path, [(0, 23_500, 24_576)], n_ctx = n_ctx)
         assert _ngl(cmd) is None
         assert _maxtok(cmd) == str(n_ctx)
@@ -299,3 +309,120 @@ def test_manual_split_is_not_refitted(monkeypatch, tmp_path):
         gpu_layers = 20,
     )
     assert _ngl(cmd) == "20"
+
+
+def _verified_launch(
+    monkeypatch, tmp_path, n_ctx, health_context, *, ready_log = None, include_requested = True
+):
+    backend = _fit_host(monkeypatch, [(0, 23_500, 24_576)])
+    backend._effective_parallel_slots = 4
+    backend._requested_n_parallel = 4
+    kills = []
+    published = []
+
+    class Child:
+        pid = 999_999_999
+        stdout = iter(())
+
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def poll(self):
+            return None
+
+    class Response:
+        status_code = 200
+
+        def json(self):
+            result = {"status": "ok", "context_length": health_context}
+            if include_requested:
+                result["requested_context_length"] = n_ctx
+            return result
+
+    def wait(**_kwargs):
+        if ready_log:
+            backend._stdout_lines.append(ready_log)
+        return True
+
+    monkeypatch.setattr(backend, "_find_diffusion_assets", lambda: (["shim"], "/bin/vs", None))
+    monkeypatch.setattr(backend, "_kill_process", lambda: kills.append(True))
+    monkeypatch.setattr(backend, "_find_free_port", lambda: 18_123)
+    monkeypatch.setattr(backend, "_wait_for_health", wait)
+    monkeypatch.setattr(backend, "_publish_healthy", lambda: published.append(True) or True)
+    monkeypatch.setattr(LlamaCppBackend, "_effective_gpu_count", staticmethod(lambda *_a: 1))
+    monkeypatch.setattr(llama_cpp_module, "_swa_cache_path", lambda: tmp_path / "swa.json")
+    monkeypatch.setattr(llama_cpp_module.subprocess, "Popen", Child)
+    monkeypatch.setattr(llama_cpp_module.httpx, "get", lambda *_a, **_k: Response())
+    monkeypatch.setattr(llama_cpp_module.time, "sleep", lambda _s: None)
+
+    def launch():
+        return backend._start_diffusion_server(
+            model_path = "/m.gguf",
+            gguf_path = "/m.gguf",
+            hf_repo = None,
+            hf_variant = None,
+            model_identifier = "diffusion",
+            n_ctx = n_ctx,
+            extra_args = None,
+        )
+
+    return backend, kills, published, launch
+
+
+def test_health_verifies_context_and_resets_stale_slots(monkeypatch, tmp_path):
+    backend, _kills, published, launch = _verified_launch(monkeypatch, tmp_path, 24576, 24576)
+    assert launch() is True
+    assert published == [True]
+    assert backend._effective_context_length == 24576
+    assert backend._effective_parallel_slots == backend._requested_n_parallel == 1
+
+
+@pytest.mark.parametrize("reported", [32768, None])
+def test_unverified_or_changed_context_never_becomes_healthy(monkeypatch, tmp_path, reported):
+    _backend, kills, published, launch = _verified_launch(monkeypatch, tmp_path, 24576, reported)
+    with pytest.raises(RuntimeError, match = "context"):
+        launch()
+    assert len(kills) == 2
+    assert not published
+
+
+def test_legacy_health_uses_native_ready_log(monkeypatch, tmp_path):
+    backend, _kills, published, launch = _verified_launch(
+        monkeypatch, tmp_path, 4096, None, include_requested = False,
+        ready_log = "diffusion-gemma-visual-server ready (MAXTOK=4096, NGL=99)",
+    )
+    assert launch() is True
+    assert published == [True]
+    assert backend._effective_context_length == 4096
+
+
+def test_legacy_shim_cannot_confirm_a_matching_auto_sized_large_context(monkeypatch, tmp_path):
+    _backend, kills, published, launch = _verified_launch(
+        monkeypatch, tmp_path, 32768, 32768, include_requested = False,
+    )
+    with pytest.raises(RuntimeError, match = "Update unsloth_zoo"):
+        launch()
+    assert len(kills) == 2
+    assert not published
+
+
+def test_native_context_error_is_reported_on_startup_failure(monkeypatch, tmp_path):
+    backend, kills, published, launch = _verified_launch(monkeypatch, tmp_path, 24576, None)
+
+    def wait(**_kwargs):
+        backend._stdout_lines.append(
+            "DIFFUSION_CONTEXT_ERROR: Requested context needs more RAM."
+        )
+        return False
+
+    monkeypatch.setattr(backend, "_wait_for_health", wait)
+    with pytest.raises(RuntimeError, match = "Requested context needs more RAM"):
+        launch()
+    assert len(kills) == 2
+    assert not published
+
+
+def test_auto_context_reports_the_resolved_budget(monkeypatch, tmp_path):
+    backend, _kills, _published, launch = _verified_launch(monkeypatch, tmp_path, 0, 32768)
+    assert launch() is True
+    assert backend._effective_context_length == 32768
